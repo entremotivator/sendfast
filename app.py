@@ -3,20 +3,37 @@ import pandas as pd
 import base64
 import io
 import json
+from PIL import Image
+import pillow_heif
 from openai import OpenAI
 
-st.set_page_config(page_title="Business Card Extractor", layout="wide")
-st.title("📇 Business Card Info Extractor")
+# ------------------ PAGE CONFIG ------------------
+st.set_page_config(
+    page_title="Business Card Extractor",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# --- Sidebar ---
+st.title("📇 Business Card Info Extractor")
+st.caption("Upload business cards (PNG, JPG, HEIC). Extract contact + social info. Export CSV.")
+
+# ------------------ SIDEBAR ------------------
 st.sidebar.header("🔑 OpenAI Settings")
-api_key = st.sidebar.text_input("OpenAI API Key", type="password")
+
+api_key = st.sidebar.text_input(
+    "OpenAI API Key",
+    type="password",
+    help="Required for vision-based extraction"
+)
 
 uploaded_files = st.sidebar.file_uploader(
     "Upload Business Card Images",
-    type=["png", "jpg", "jpeg"],
+    type=["png", "jpg", "jpeg", "heic", "heif"],
     accept_multiple_files=True
 )
+
+st.sidebar.markdown("---")
+st.sidebar.caption("Built for Streamlit Community Cloud")
 
 if not api_key:
     st.warning("Please enter your OpenAI API key in the sidebar.")
@@ -24,16 +41,39 @@ if not api_key:
 
 client = OpenAI(api_key=api_key)
 
-# --- Extraction Function ---
+# ------------------ IMAGE HANDLING ------------------
+def load_and_convert_image(uploaded_file):
+    suffix = uploaded_file.name.split(".")[-1].lower()
+
+    if suffix in ["heic", "heif"]:
+        heif_file = pillow_heif.read_heif(uploaded_file)
+        image = Image.frombytes(
+            heif_file.mode,
+            heif_file.size,
+            heif_file.data,
+            "raw"
+        )
+    else:
+        image = Image.open(uploaded_file)
+
+    image = image.convert("RGB")
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=95)
+    buffer.seek(0)
+
+    return buffer.read()
+
+# ------------------ OPENAI EXTRACTION ------------------
 def extract_business_card_info(image_bytes):
-    image_base64 = base64.b64encode(image_bytes).decode()
+    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {
                 "role": "system",
-                "content": "Extract structured contact and social media information from business cards."
+                "content": "You extract structured contact and social media information from business cards."
             },
             {
                 "role": "user",
@@ -41,7 +81,8 @@ def extract_business_card_info(image_bytes):
                     {
                         "type": "text",
                         "text": (
-                            "Extract ALL business card information and return VALID JSON with these fields:\n\n"
+                            "Extract ALL information from this business card and return VALID JSON ONLY.\n\n"
+                            "Fields:\n"
                             "name\n"
                             "title\n"
                             "company\n"
@@ -57,13 +98,13 @@ def extract_business_card_info(image_bytes):
                             "tiktok\n"
                             "other_socials\n"
                             "notes\n\n"
-                            "If a field is missing, return an empty string."
+                            "If missing, return empty string. No explanations."
                         )
                     },
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/png;base64,{image_base64}"
+                            "url": f"data:image/jpeg;base64,{image_base64}"
                         }
                     }
                 ]
@@ -74,33 +115,32 @@ def extract_business_card_info(image_bytes):
 
     return response.choices[0].message.content
 
-# --- Main ---
-data_rows = []
+# ------------------ MAIN LOGIC ------------------
+rows = []
 
 if uploaded_files:
-    st.subheader("📄 Extracted Data")
+    st.subheader("📄 Extracted Results")
 
     for file in uploaded_files:
         with st.spinner(f"Processing {file.name}..."):
-            image_bytes = file.read()
-            result = extract_business_card_info(image_bytes)
-
             try:
+                image_bytes = load_and_convert_image(file)
+                result = extract_business_card_info(image_bytes)
                 parsed = json.loads(result)
+
+                parsed["source_file"] = file.name
+                rows.append(parsed)
+
+                st.markdown(f"### {file.name}")
+                st.json(parsed)
+
             except Exception as e:
-                st.error(f"Failed to parse JSON from {file.name}")
-                st.code(result)
-                continue
+                st.error(f"Failed to process {file.name}")
+                st.code(str(e))
 
-            parsed["source_file"] = file.name
-            data_rows.append(parsed)
-
-            st.markdown(f"### {file.name}")
-            st.json(parsed)
-
-# --- CSV Export ---
-if data_rows:
-    df = pd.DataFrame(data_rows)
+# ------------------ CSV EXPORT ------------------
+if rows:
+    df = pd.DataFrame(rows)
 
     st.subheader("⬇️ Download CSV")
     csv_buffer = io.StringIO()
@@ -109,6 +149,6 @@ if data_rows:
     st.download_button(
         label="Download Business Cards CSV",
         data=csv_buffer.getvalue(),
-        file_name="business_cards_with_socials.csv",
+        file_name="business_cards_extracted.csv",
         mime="text/csv"
     )
